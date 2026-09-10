@@ -469,29 +469,22 @@ func startOfMonth(_ d: Date) -> Date {
     return cal.date(from: c).map(startOfDay) ?? startOfDay(d)
 }
 
-/// 周日为一周起点（Codex / GitHub 贡献图）
-func startOfSundayWeek(_ d: Date) -> Date {
-    let cal = Calendar.current
-    let day = startOfDay(d)
-    let weekday = cal.component(.weekday, from: day) // 1=Sun … 7=Sat
-    return cal.date(byAdding: .day, value: -(weekday - 1), to: day) ?? day
-}
-
-func dayKey(_ d: Date) -> Int {
-    let c = Calendar.current.dateComponents([.year, .month, .day], from: d)
-    return (c.year! * 10_000) + (c.month! * 100) + c.day!
-}
-
-/// Codex 风格绿阶贡献图（仅网格 + 悬停浮窗；折叠/合计用菜单项）
-final class HeatmapGridView: NSView {
+/// Codex 风格：周日为首、绿阶贡献图 + 悬停浮窗；侧边切换本周/本月合计；可折叠
+final class HeatmapPanelView: NSView {
     var days: [DayTokens] = [] { didSet { needsDisplay = true } }
     var weekCount: Int = HEATMAP_WEEKS
+    var expanded: Bool = true { didSet { needsDisplay = true } }
+    var summaryMode: String = "week" { didSet { needsDisplay = true } }
+    weak var target: AnyObject?
+    var toggleExpandAction: Selector?
+    var toggleSummaryAction: Selector?
 
     private var hoveredDay: Date?
     private var hoveredTokens: Int64 = 0
     private var tracking: NSTrackingArea?
     private var cellFrames: [(rect: NSRect, day: Date, tokens: Int64)] = []
-    private var tokenByDay: [Int: Int64] = [:]
+    private var weekSegRect: NSRect = .zero
+    private var monthSegRect: NSRect = .zero
 
     private func heatColor(level: Int) -> NSColor {
         func rgb(_ h: UInt32) -> NSColor {
@@ -521,7 +514,6 @@ final class HeatmapGridView: NSView {
     }
 
     override var isFlipped: Bool { true }
-    override var acceptsFirstResponder: Bool { true }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -539,8 +531,9 @@ final class HeatmapGridView: NSView {
             hit = (c.day, c.tokens)
             break
         }
-        if hit?.0 != hoveredDay {
-            hoveredDay = hit?.0
+        let newDay = hit?.0
+        if newDay != hoveredDay {
+            hoveredDay = newDay
             hoveredTokens = hit?.1 ?? 0
             needsDisplay = true
         }
@@ -553,25 +546,91 @@ final class HeatmapGridView: NSView {
         }
     }
 
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        let headerH: CGFloat = 28
+        if p.y <= headerH {
+            if weekSegRect.contains(p) || monthSegRect.contains(p) {
+                let wantMonth = monthSegRect.contains(p)
+                let next = wantMonth ? "month" : "week"
+                if next != summaryMode, let t = target, let a = toggleSummaryAction {
+                    // toggleHeatmapSummary 会翻转；若已是目标则不调
+                    let cur = UserDefaults.standard.string(forKey: HEATMAP_SUMMARY_KEY) ?? "week"
+                    if cur != next {
+                        _ = NSApp.sendAction(a, to: t, from: self)
+                    }
+                }
+                return
+            }
+            if p.x < bounds.width * 0.48 {
+                if let t = target, let a = toggleExpandAction {
+                    _ = NSApp.sendAction(a, to: t, from: self)
+                }
+            }
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         cellFrames.removeAll(keepingCapacity: true)
-        tokenByDay = Dictionary(uniqueKeysWithValues: days.map { (dayKey($0.day), $0.tokens) })
+        let headerH: CGFloat = 28
+        let pad: CGFloat = 10
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: 12),
+            .foregroundColor: NSColor.labelColor]
+
+        let chevron = expanded ? "▼" : "▶"
+        ("\(chevron)  用量热力图" as NSString).draw(at: NSPoint(x: pad, y: 6), withAttributes: titleAttrs)
+
+        let today = startOfDay(Date())
+        let weekTok = tokensInRange(days: days, from: startOfWeek(today), to: today)
+        let monthTok = tokensInRange(days: days, from: startOfMonth(today), to: today)
+        let isWeek = summaryMode != "month"
+        // 侧边分段：本周 | 本月
+        let segFont = NSFont.systemFont(ofSize: 10, weight: .medium)
+        let onAttrs: [NSAttributedString.Key: Any] = [.font: segFont, .foregroundColor: NSColor.labelColor]
+        let offAttrs: [NSAttributedString.Key: Any] = [.font: segFont, .foregroundColor: NSColor.tertiaryLabelColor]
+        let weekTitle = "本周 \(fmtTokens(weekTok))"
+        let monthTitle = "本月 \(fmtTokens(monthTok))"
+        let weekW = (weekTitle as NSString).size(withAttributes: onAttrs).width
+        let monthW = (monthTitle as NSString).size(withAttributes: onAttrs).width
+        let gapSeg: CGFloat = 10
+        let segTotal = weekW + gapSeg + monthW
+        let segX = bounds.width - pad - segTotal
+        weekSegRect = NSRect(x: segX - 4, y: 0, width: weekW + 8, height: headerH)
+        monthSegRect = NSRect(x: segX + weekW + gapSeg - 4, y: 0, width: monthW + 8, height: headerH)
+        (weekTitle as NSString).draw(at: NSPoint(x: segX, y: 7), withAttributes: isWeek ? onAttrs : offAttrs)
+        (monthTitle as NSString).draw(at: NSPoint(x: segX + weekW + gapSeg, y: 7), withAttributes: isWeek ? offAttrs : onAttrs)
+        let ulY: CGFloat = 22
+        let ulX = isWeek ? segX : segX + weekW + gapSeg
+        let ulW = isWeek ? weekW : monthW
+        NSColor.controlAccentColor.setStroke()
+        let ul = NSBezierPath()
+        ul.move(to: NSPoint(x: ulX, y: ulY))
+        ul.line(to: NSPoint(x: ulX + ulW, y: ulY))
+        ul.lineWidth = 1.5
+        ul.stroke()
+
+
+        guard expanded else { return }
 
         let cal = Calendar.current
-        let today = startOfDay(Date())
-        // 右端对齐本周（含今天），避免末列停在上周
-        let thisSunday = startOfSundayWeek(today)
-        guard let gridStart = cal.date(byAdding: .day, value: -7 * (weekCount - 1), to: thisSunday) else { return }
+        let rangeDays = weekCount * 7
+        let rangeStart = cal.date(byAdding: .day, value: -(rangeDays - 1), to: today) ?? today
+        let wd = cal.component(.weekday, from: rangeStart)
+        let gridStart = cal.date(byAdding: .day, value: -(wd - 1), to: rangeStart) ?? rangeStart
 
-        let visibleToks = days.compactMap { d -> Int64? in
-            guard d.day >= gridStart, d.day <= today else { return nil }
-            return d.tokens
-        }
+        var tokenMap: [TimeInterval: Int64] = [:]
+        for d in days { tokenMap[d.day.timeIntervalSince1970] = d.tokens }
+        let visibleToks = tokenMap.filter { kv in
+            let day = Date(timeIntervalSince1970: kv.key)
+            return day >= rangeStart && day <= today
+        }.map(\.value)
         let maxTok = max(visibleToks.max() ?? 0, 1)
 
         let leftPad: CGFloat = 28
-        let topPad: CGFloat = 16
-        let pad: CGFloat = 10
+        let topPad: CGFloat = headerH + 16
         let gap: CGFloat = 2
         let availW = bounds.width - leftPad - pad
         let pitch = availW / CGFloat(weekCount)
@@ -588,11 +647,10 @@ final class HeatmapGridView: NSView {
             if m != lastMonth, dayNum <= 7 {
                 lastMonth = m
                 let x = leftPad + CGFloat(w) * pitch
-                (mf.string(from: weekStart) as NSString).draw(at: NSPoint(x: x, y: 1), withAttributes: attrs)
+                (mf.string(from: weekStart) as NSString).draw(at: NSPoint(x: x, y: headerH + 2), withAttributes: attrs)
             }
         }
 
-        // Sun=0 … Sat=6；标签放在一/三/五
         let rowLabels = ["", "一", "", "三", "", "五", ""]
         for (i, name) in rowLabels.enumerated() where !name.isEmpty {
             let y = topPad + CGFloat(i) * pitch + (pitch - 10) / 2
@@ -602,21 +660,20 @@ final class HeatmapGridView: NSView {
         for w in 0..<weekCount {
             for dow in 0..<7 {
                 guard let day = cal.date(byAdding: .day, value: w * 7 + dow, to: gridStart) else { continue }
-                let sod = startOfDay(day)
-                guard sod <= today else { continue }
-                let tok = tokenByDay[dayKey(sod)] ?? 0
+                guard day >= rangeStart, day <= today else { continue }
+                let tok = tokenMap[day.timeIntervalSince1970] ?? 0
                 let x = leftPad + CGFloat(w) * pitch + (pitch - cell) / 2
                 let y = topPad + CGFloat(dow) * pitch + (pitch - cell) / 2
                 let rect = NSRect(x: x, y: y, width: cell, height: cell)
-                cellFrames.append((rect, sod, tok))
+                cellFrames.append((rect, day, tok))
                 heatColor(level: level(for: tok, maxTok: maxTok)).setFill()
                 let corner = min(cell * 0.22, 2.5)
                 let path = NSBezierPath(roundedRect: rect, xRadius: corner, yRadius: corner)
                 path.fill()
-                let isHover = hoveredDay.map { cal.isDate($0, inSameDayAs: sod) } ?? false
-                let isToday = cal.isDate(sod, inSameDayAs: today)
+                let isHover = hoveredDay.map { cal.isDate($0, inSameDayAs: day) } ?? false
+                let isToday = cal.isDate(day, inSameDayAs: today)
                 if isHover || isToday {
-                    NSColor.labelColor.withAlphaComponent(isHover ? 0.75 : 0.45).setStroke()
+                    NSColor.labelColor.withAlphaComponent(isHover ? 0.75 : 0.35).setStroke()
                     path.lineWidth = isHover ? 1.5 : 1
                     path.stroke()
                 }
@@ -634,14 +691,15 @@ final class HeatmapGridView: NSView {
         ("多" as NSString).draw(at: NSPoint(x: lx + 2, y: legendY), withAttributes: attrs)
 
         if let hd = hoveredDay {
-            drawTooltip(day: hd, tokens: hoveredTokens, gridTop: topPad, gridHeight: 7 * pitch)
+            drawTooltip(day: hd, tokens: hoveredTokens, in: bounds, gridTop: topPad, gridHeight: 7 * pitch)
         }
     }
 
-    private func drawTooltip(day: Date, tokens: Int64, gridTop: CGFloat, gridHeight: CGFloat) {
+    private func drawTooltip(day: Date, tokens: Int64, in bounds: NSRect, gridTop: CGFloat, gridHeight: CGFloat) {
         let df = DateFormatter()
         df.locale = Locale(identifier: "zh_CN")
-        df.dateFormat = "yyyy年M月d日 EEEE"
+        df.dateStyle = .medium
+        df.timeStyle = .none
         let title = "\(fmtTokens(tokens)) tokens"
         let subtitle = df.string(from: day)
         let titleAttrs: [NSAttributedString.Key: Any] = [
@@ -673,20 +731,28 @@ final class HeatmapGridView: NSView {
         (subtitle as NSString).draw(at: NSPoint(x: ox + 8, y: oy + 22), withAttributes: subAttrs)
     }
 
-    static func preferredSize(weeks: Int) -> NSSize {
+    static func preferredSize(weeks: Int, expanded: Bool) -> NSSize {
         let width: CGFloat = 320
+        if !expanded { return NSSize(width: width, height: 28) }
         let pitch = (width - 28 - 10) / CGFloat(weeks)
-        let h: CGFloat = 16 + 7 * pitch + 22
+        let h: CGFloat = 28 + 16 + 7 * pitch + 22
         return NSSize(width: width, height: h)
     }
 }
 
-func makeHeatmapGridItem(days: [DayTokens]) -> NSMenuItem {
+func makeHeatmapPanel(days: [DayTokens], target: AnyObject) -> NSMenuItem {
+    let expanded = UserDefaults.standard.object(forKey: HEATMAP_EXPANDED_KEY) as? Bool ?? true
+    let summary = UserDefaults.standard.string(forKey: HEATMAP_SUMMARY_KEY) ?? "week"
     let item = NSMenuItem()
-    let size = HeatmapGridView.preferredSize(weeks: HEATMAP_WEEKS)
-    let view = HeatmapGridView(frame: NSRect(origin: .zero, size: size))
+    let size = HeatmapPanelView.preferredSize(weeks: HEATMAP_WEEKS, expanded: expanded)
+    let view = HeatmapPanelView(frame: NSRect(origin: .zero, size: size))
     view.days = days
     view.weekCount = HEATMAP_WEEKS
+    view.expanded = expanded
+    view.summaryMode = summary
+    view.target = target
+    view.toggleExpandAction = #selector(AppDelegate.toggleHeatmapExpand)
+    view.toggleSummaryAction = #selector(AppDelegate.toggleHeatmapSummary)
     item.view = view
     return item
 }
@@ -699,12 +765,6 @@ func dashboardURLForRecentRange(days: Int = 7) -> URL {
     let to = startOfDay(Date())
     let from = Calendar.current.date(byAdding: .day, value: -(days - 1), to: to) ?? to
     return URL(string: "\(DASHBOARD_BASE)?from=\(df.string(from: from))&to=\(df.string(from: to))")!
-}
-
-func reopenStatusMenu(_ statusItem: NSStatusItem) {
-    DispatchQueue.main.async {
-        statusItem.button?.performClick(nil)
-    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -850,33 +910,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             menu.addItem(.separator())
 
-            // 用量热力图：折叠/合计用菜单项（可点）；网格单独视图
-            let expanded = UserDefaults.standard.object(forKey: HEATMAP_EXPANDED_KEY) as? Bool ?? true
-            let summary = UserDefaults.standard.string(forKey: HEATMAP_SUMMARY_KEY) ?? "week"
-            let today = startOfDay(Date())
-            let weekTok = tokensInRange(days: snap.dailyTokens, from: startOfWeek(today), to: today)
-            let monthTok = tokensInRange(days: snap.dailyTokens, from: startOfMonth(today), to: today)
-
-            let heatToggle = NSMenuItem(
-                title: expanded ? "▼  用量热力图" : "▶  用量热力图",
-                action: #selector(toggleHeatmapExpand),
-                keyEquivalent: "")
-            heatToggle.target = self
-            menu.addItem(heatToggle)
-
-            let summaryTitle = summary == "month"
-                ? "本月合计  \(fmtTokens(monthTok))   ↺ 切本周"
-                : "本周合计  \(fmtTokens(weekTok))   ↺ 切本月"
-            let summaryItem = NSMenuItem(
-                title: summaryTitle,
-                action: #selector(toggleHeatmapSummary),
-                keyEquivalent: "")
-            summaryItem.target = self
-            menu.addItem(summaryItem)
-
-            if expanded {
-                menu.addItem(makeHeatmapGridItem(days: snap.dailyTokens))
-            }
+            // Codex 风格用量热力图（可折叠；侧边本周/本月；悬停浮窗）
+            menu.addItem(makeHeatmapPanel(days: snap.dailyTokens, target: self))
             menu.addItem(.separator())
         }
 
@@ -918,14 +953,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cur = UserDefaults.standard.object(forKey: HEATMAP_EXPANDED_KEY) as? Bool ?? true
         UserDefaults.standard.set(!cur, forKey: HEATMAP_EXPANDED_KEY)
         rebuildMenu()
-        reopenStatusMenu(statusItem)
+        // 折叠后立刻重开下拉，避免整菜单关掉
+        DispatchQueue.main.async { [weak self] in
+            self?.statusItem.button?.performClick(nil)
+        }
     }
 
     @objc func toggleHeatmapSummary() {
         let cur = UserDefaults.standard.string(forKey: HEATMAP_SUMMARY_KEY) ?? "week"
         UserDefaults.standard.set(cur == "week" ? "month" : "week", forKey: HEATMAP_SUMMARY_KEY)
+        // 仅刷新面板合计：重建菜单并保持打开
         rebuildMenu()
-        reopenStatusMenu(statusItem)
+        DispatchQueue.main.async { [weak self] in
+            self?.statusItem.button?.performClick(nil)
+        }
     }
 
     @objc func doRefresh() { refresh() }
