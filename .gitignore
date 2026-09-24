@@ -1,0 +1,16 @@
+# Build output
+cursor-usage-menubar
+*.o
+
+# Local / scratch
+.tmp-images/
+.DS_Store
+*.swp
+*~
+
+# Secrets & local env (never commit)
+.env
+.env.*
+*.pem
+*.key
+credentials.json
