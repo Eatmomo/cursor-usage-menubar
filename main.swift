@@ -76,10 +76,18 @@ let iconImage: NSImage? = {
     return img
 }()
 
+/// Grok bot（Slack / 自动化等）事件的模型名都以 grok-bot- 开头
+func isGrokBotModel(_ model: String) -> Bool {
+    model.lowercased().hasPrefix("grok-bot")
+}
+
 struct DayTokens: Equatable {
     var day: Date   // 当天 00:00
-    var tokens: Int64
+    var tokens: Int64      // Cursor + Grok bot
     var events: Int
+    var botTokens: Int64   // 其中 Grok bot 部分
+    var botEvents: Int
+    var cursorTokens: Int64 { tokens - botTokens }
 }
 
 /// 单条用量事件，只保留热力图和小票用到的字段
@@ -584,18 +592,21 @@ func dayKey(_ d: Date) -> Int {
 }
 
 func buildDailyTokens(from events: [UsageEvent]) -> [DayTokens] {
-    var map: [Int: (Date, Int64, Int)] = [:]
+    var map: [Int: DayTokens] = [:]
     for e in events {
         let day = eventDay(e.ts)
         let key = dayKey(day)
         let tok = e.input + e.output + e.cacheRead + e.cacheWrite
-        let cur = map[key] ?? (day, 0, 0)
-        map[key] = (cur.0, cur.1 + tok, cur.2 + 1)
+        var cur = map[key] ?? DayTokens(day: day, tokens: 0, events: 0, botTokens: 0, botEvents: 0)
+        cur.tokens += tok
+        cur.events += 1
+        if isGrokBotModel(e.model) {
+            cur.botTokens += tok
+            cur.botEvents += 1
+        }
+        map[key] = cur
     }
-    return map.keys.sorted().compactMap { k in
-        guard let v = map[k] else { return nil }
-        return DayTokens(day: v.0, tokens: v.1, events: v.2)
-    }
+    return map.keys.sorted().compactMap { map[$0] }
 }
 
 
@@ -691,7 +702,8 @@ func modelInfo(_ raw: String) -> ModelInfo {
         ModelInfo(display: display, rate: FALLBACK_RATE, rateLabel: FALLBACK_RATE_LABEL, fallback: true)
     }
     if k.isEmpty || k == "?" { return fallback(raw.isEmpty ? "?" : raw) }
-    if k == "default" || k == "auto" || k.hasPrefix("auto-") || k.hasSuffix("-auto") || k == "grok-bot-default" {
+    if isGrokBotModel(k) { return fallback("Grok bot") }
+    if k == "default" || k == "auto" || k.hasPrefix("auto-") || k.hasSuffix("-auto") {
         return fallback("Auto")
     }
     for (pat, rate, display) in RATE_TABLE where k == pat || k.hasPrefix(pat + "-") || k.contains(pat) {
@@ -1310,6 +1322,8 @@ final class HeatmapGridView: NSView {
         var rect: NSRect
         var day: Date
         var tokens: Int64
+        var cursorTokens: Int64
+        var botTokens: Int64
         var level: Int
     }
 
@@ -1326,7 +1340,8 @@ final class HeatmapGridView: NSView {
     private var hoveredIndex: Int?
     private var tooltipRect: NSRect = .zero
     private var tooltipTitle = ""
-    private var tooltipSubtitle = ""
+    /// 标题下的小字行：Cursor / Grok bot 分项与日期
+    private var tooltipLines: [String] = []
     private var tracking: NSTrackingArea?
 
     private static func rgb(_ h: UInt32) -> NSColor {
@@ -1388,10 +1403,10 @@ final class HeatmapGridView: NSView {
         let thisSunday = startOfSundayWeek(today)
         let gridStart = cal.date(byAdding: .day, value: -7 * (weekCount - 1), to: thisSunday) ?? thisSunday
 
-        var tokenByDay: [Int: Int64] = [:]
+        var dayByKey: [Int: DayTokens] = [:]
         var maxTok: Int64 = 1
         for d in days where d.day >= gridStart && d.day <= today {
-            tokenByDay[dayKey(d.day), default: 0] += d.tokens
+            dayByKey[dayKey(d.day)] = d
             maxTok = max(maxTok, d.tokens)
         }
 
@@ -1407,11 +1422,14 @@ final class HeatmapGridView: NSView {
             let sod = startOfDay(raw)
             guard sod <= today else { cells.append(nil); continue }
             let key = dayKey(sod)
-            let tok = tokenByDay[key] ?? 0
+            let d = dayByKey[key]
+            let tok = d?.tokens ?? 0
             let x = Self.leftPad + CGFloat(i / 7) * pitch + (pitch - size) / 2
             let y = Self.topPad + CGFloat(i % 7) * pitch + (pitch - size) / 2
             cells.append(Cell(rect: NSRect(x: x, y: y, width: size, height: size),
-                              day: sod, tokens: tok, level: level(for: tok, maxTok: maxTok)))
+                              day: sod, tokens: tok,
+                              cursorTokens: d?.cursorTokens ?? 0, botTokens: d?.botTokens ?? 0,
+                              level: level(for: tok, maxTok: maxTok)))
             if key == todayKey { todayIndex = i }
         }
 
@@ -1447,16 +1465,22 @@ final class HeatmapGridView: NSView {
 
     private func updateTooltip(for i: Int) {
         guard let c = cells[i] else { return }
-        tooltipTitle = "\(fmtTokensCN(c.tokens)) tokens"
-        tooltipSubtitle = Fmt.ymdWeekday.string(from: c.day)
-        let tw = max((tooltipTitle as NSString).size(withAttributes: Self.tipTitleAttrs).width,
-                     (tooltipSubtitle as NSString).size(withAttributes: Self.tipSubAttrs).width) + 16
-        let th: CGFloat = 40
-        let gridTop = Self.topPad
-        let ox = min(max(c.rect.midX - tw / 2, 8), bounds.width - tw - 8)
-        var oy = c.rect.minY - th - 6
-        if oy < gridTop { oy = c.rect.minY + 14 }
-        if oy + th > bounds.height - 4 { oy = max(gridTop, bounds.height - th - 4) }
+        tooltipTitle = "总计 \(fmtTokensCN(c.tokens)) tokens"
+        tooltipLines = [
+            "Cursor  \(fmtTokensCN(c.cursorTokens))",
+            "Grok bot  \(fmtTokensCN(c.botTokens))",
+            Fmt.ymdWeekday.string(from: c.day),
+        ]
+        let tw = tooltipLines.reduce((tooltipTitle as NSString).size(withAttributes: Self.tipTitleAttrs).width) {
+            max($0, ($1 as NSString).size(withAttributes: Self.tipSubAttrs).width)
+        } + 16
+        let th: CGFloat = 26 + CGFloat(tooltipLines.count) * 14
+        // 浮窗只能画在本视图内：放在格子右侧，放不下则放左侧，避免盖住鼠标
+        let sideGap: CGFloat = 8
+        var ox = c.rect.maxX + sideGap
+        if ox + tw > bounds.width - 2 { ox = c.rect.minX - sideGap - tw }
+        ox = max(ox, 2)
+        let oy = min(max(c.rect.midY - th / 2, 2), bounds.height - th - 2)
         tooltipRect = NSRect(x: ox, y: oy, width: tw, height: th)
     }
 
@@ -1535,7 +1559,10 @@ final class HeatmapGridView: NSView {
             bg.lineWidth = 1
             bg.stroke()
             (tooltipTitle as NSString).draw(at: NSPoint(x: tooltipRect.minX + 8, y: tooltipRect.minY + 6), withAttributes: Self.tipTitleAttrs)
-            (tooltipSubtitle as NSString).draw(at: NSPoint(x: tooltipRect.minX + 8, y: tooltipRect.minY + 22), withAttributes: Self.tipSubAttrs)
+            for (i, line) in tooltipLines.enumerated() {
+                (line as NSString).draw(at: NSPoint(x: tooltipRect.minX + 8, y: tooltipRect.minY + 22 + CGFloat(i) * 14),
+                                        withAttributes: Self.tipSubAttrs)
+            }
         }
     }
 
