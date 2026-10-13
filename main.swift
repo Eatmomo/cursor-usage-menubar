@@ -475,7 +475,7 @@ func withAuth<T>(_ body: (Auth) async throws -> T) async throws -> T {
 
 struct AuthMissing: Error {}
 
-let apiSession: URLSession = {
+func makeAPISession() -> URLSession {
     let c = URLSessionConfiguration.ephemeral
     c.urlCache = nil
     c.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -485,7 +485,48 @@ let apiSession: URLSession = {
     c.timeoutIntervalForResource = 60
     c.httpMaximumConnectionsPerHost = 4
     return URLSession(configuration: c)
-}()
+}
+
+/// 代理（TUN / fake-ip）切换或睡眠唤醒后，复用的旧连接可能已被静默丢弃，
+/// 继续用同一个 session 会一直超时；遇到网络类错误时整体换新 session。
+final class APISessionHolder: @unchecked Sendable {
+    static let shared = APISessionHolder()
+    private let lock = NSLock()
+    private var session = makeAPISession()
+
+    var current: URLSession {
+        lock.lock(); defer { lock.unlock() }
+        return session
+    }
+
+    func reset(ifStill old: URLSession) {
+        lock.lock()
+        guard session === old else { lock.unlock(); return }
+        session = makeAPISession()
+        lock.unlock()
+        old.finishTasksAndInvalidate()
+    }
+}
+
+func isStaleConnectionError(_ error: Error) -> Bool {
+    guard let e = error as? URLError else { return false }
+    switch e.code {
+    case .timedOut, .networkConnectionLost, .cannotConnectToHost, .secureConnectionFailed, .notConnectedToInternet:
+        return true
+    default:
+        return false
+    }
+}
+
+func apiData(for req: URLRequest) async throws -> (Data, URLResponse) {
+    let s = APISessionHolder.shared.current
+    do {
+        return try await s.data(for: req)
+    } catch where isStaleConnectionError(error) {
+        APISessionHolder.shared.reset(ifStill: s)
+        return try await APISessionHolder.shared.current.data(for: req)
+    }
+}
 
 func httpJSON(url: String, method: String, token: String, userId: String?, body: [String: Any]?) async throws -> [String: Any] {
     guard let u = URL(string: url) else { throw URLError(.badURL) }
@@ -506,7 +547,7 @@ func httpJSON(url: String, method: String, token: String, userId: String?, body:
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
     }
-    let (data, resp) = try await apiSession.data(for: req)
+    let (data, resp) = try await apiData(for: req)
     if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
         let msg = String(data: data, encoding: .utf8)?.prefix(160) ?? ""
         throw NSError(domain: "cursor-usage", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "http-\(http.statusCode) \(msg)"])
@@ -2516,7 +2557,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func sysWillSleep() { pause("sleep") }
-    @objc private func sysDidWake() { resume("sleep") }
+    @objc private func sysDidWake() {
+        APISessionHolder.shared.reset(ifStill: APISessionHolder.shared.current)
+        resume("sleep")
+    }
     @objc private func screensSlept() { pause("display") }
     @objc private func screensWoke() { resume("display") }
     @objc private func sessionResigned() { pause("session") }
